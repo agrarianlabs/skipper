@@ -1,18 +1,22 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	oidc "github.com/coreos/go-oidc"
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/filters"
 	logfilter "github.com/zalando/skipper/filters/log"
+	"golang.org/x/oauth2"
 )
 
 type roleCheckType int
@@ -26,6 +30,9 @@ const (
 	checkOAuthTokenintrospectionAllClaims
 	checkOAuthTokenintrospectionAnyKV
 	checkOAuthTokenintrospectionAllKV
+	checkOidcUserInfos
+	checkOidcAnyClaims
+	checkOidcAllClaims
 	checkUnknown
 )
 
@@ -51,6 +58,9 @@ const (
 	OAuthTokenintrospectionAllClaimsName = "oauthTokenintrospectionAllClaims"
 	OAuthTokenintrospectionAnyKVName     = "oauthTokenintrospectionAnyKV"
 	OAuthTokenintrospectionAllKVName     = "oauthTokenintrospectionAllKV"
+	OidcUserInfoName                     = "oauthOidcUserInfo"
+	OidcAnyClaimsName                    = "oauthOidcAnyClaims"
+	OidcAllClaimsName                    = "oauthOidcAllClaims"
 	AuthUnknown                          = "authUnknown"
 
 	authHeaderName               = "Authorization"
@@ -622,6 +632,7 @@ func NewOAuthTokenintrospectionAllKV(oauthIssuerURL, oauthIntrospectionURL strin
 func NewOAuthTokenintrospectionAnyClaims(oauthIssuerURL, oauthIntrospectionURL string) filters.Spec {
 	return newOAuthTokenintrospectionFilter(checkOAuthTokenintrospectionAnyClaims, oauthIssuerURL, oauthIntrospectionURL)
 }
+
 func NewOAuthTokenintrospectionAllClaims(oauthIssuerURL, oauthIntrospectionURL string) filters.Spec {
 	return newOAuthTokenintrospectionFilter(checkOAuthTokenintrospectionAllClaims, oauthIssuerURL, oauthIntrospectionURL)
 }
@@ -816,3 +827,293 @@ func (f *tokenintrospectFilter) Request(ctx filters.FilterContext) {
 	ctx.StateBag()[tokeninfoCacheKey] = info
 }
 func (f *tokenintrospectFilter) Response(filters.FilterContext) {}
+
+type (
+	tokenOidcSpec struct {
+		typ roleCheckType
+	}
+
+	tokenOidcFilter struct {
+		typ      roleCheckType
+		config   *oauth2.Config
+		provider *oidc.Provider
+		verifier *oidc.IDTokenVerifier
+		claims   []string
+	}
+)
+
+func NewOAuthOidcUserInfos() filters.Spec { return &tokenOidcSpec{typ: checkOidcUserInfos} }
+func NewOAuthOidcAnyClaims() filters.Spec { return &tokenOidcSpec{typ: checkOidcAnyClaims} }
+func NewOAuthOidcAllClaims() filters.Spec { return &tokenOidcSpec{typ: checkOidcAllClaims} }
+
+// CreateFilter creates an OpenID Connect authorization filter.
+//
+// first arg: a provider, for example "https://accounts.google.com",
+//            which has the path /.well-known/openid-configuration
+//
+// Example:
+//
+//     tokenOidcSpec("https://accounts.google.com", "255788903420-c68l9ustnfqkvukessbn46d92tirvh6s.apps.googleusercontent.com", "hjY8LHp9bPe97hS0aqXGh_zL", "http://127.0.0.1:5556/auth/google/callback")
+func (s *tokenOidcSpec) CreateFilter(args []interface{}) (filters.Filter, error) {
+	sargs, err := getStrings(args)
+	if err != nil {
+		return nil, err
+	}
+	if len(sargs) < 4 {
+		return nil, filters.ErrInvalidFilterParameters
+	}
+
+	providerURL, err := url.Parse(sargs[0])
+
+	ctx := context.Background()
+	provider, err := oidc.NewProvider(ctx, providerURL.String())
+	if err != nil {
+		return nil, filters.ErrInvalidFilterParameters
+	}
+
+	f := &tokenOidcFilter{
+		typ: s.typ,
+		config: &oauth2.Config{
+			ClientID:     sargs[1],
+			ClientSecret: sargs[2],
+			RedirectURL:  sargs[3], // self endpoint
+			Endpoint:     provider.Endpoint(),
+		},
+		provider: provider,
+		verifier: provider.Verifier(&oidc.Config{
+			ClientID: sargs[1],
+		}),
+	}
+	f.config.Scopes = []string{oidc.ScopeOpenID}
+
+	switch f.typ {
+	case checkOidcUserInfos:
+		if len(sargs) > 4 { // google IAM needs a scope to be sent
+			f.config.Scopes = append(f.config.Scopes, sargs[4:]...)
+		} else {
+			// Scope check is required for auth code flow
+			return nil, filters.ErrInvalidFilterParameters
+		}
+	case checkOidcAnyClaims:
+		fallthrough
+	case checkOidcAllClaims:
+		f.config.Scopes = append(f.config.Scopes, sargs[4:]...)
+		f.claims = sargs[4:]
+	}
+	return f, nil
+}
+
+func (s *tokenOidcSpec) Name() string {
+	switch s.typ {
+	case checkOidcUserInfos:
+		return OidcUserInfoName
+	case checkOidcAnyClaims:
+		return OidcAnyClaimsName
+	case checkOidcAllClaims:
+		return OidcAllClaimsName
+	}
+	return AuthUnknown
+}
+
+func (f *tokenOidcFilter) validateAnyClaims(h map[string]interface{}) bool {
+	if len(f.claims) == 0 {
+		return true
+	}
+
+	var a []string
+	for k, _ := range h {
+		a = append(a, k)
+	}
+
+	return intersect(f.claims, a)
+}
+
+func (f *tokenOidcFilter) validateAllClaims(h map[string]interface{}) bool {
+	if len(f.claims) == 0 {
+		return true
+	}
+
+	var a []string
+	for k, _ := range h {
+		a = append(a, k)
+	}
+
+	log.Infof("all(%v, %v)", f.claims, a)
+	return all(f.claims, a)
+}
+
+const (
+	letterBytes   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	letterIdxBits = 6                    // 6 bits to represent a letter index
+	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
+	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
+)
+
+var (
+	src      = rand.NewSource(time.Now().UnixNano())
+	stateMap = make(map[string]bool)
+)
+
+// https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-golang
+func randString(n int) string {
+	b := make([]byte, n)
+	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
+	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
+		if remain == 0 {
+			cache, remain = src.Int63(), letterIdxMax
+		}
+		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
+			b[i] = letterBytes[idx]
+			i--
+		}
+		cache >>= letterIdxBits
+		remain--
+	}
+
+	return string(b)
+}
+
+func (f *tokenOidcFilter) Response(ctx filters.FilterContext) {}
+func (f *tokenOidcFilter) Request(ctx filters.FilterContext) {
+	var state string
+	log.Infof("tokenOidcFilter got a request")
+	r := ctx.Request()
+	stateQuery := r.URL.Query().Get("state")
+	_, ok := stateMap[stateQuery]
+	if ok {
+		state = stateQuery
+	} else {
+		state = randString(30)
+		stateMap[state] = true
+		log.Infof("serve redirect: f:%v, f.config:%v", f, f.config)
+		ctx.Serve(&http.Response{
+			Header:     http.Header{"Location": []string{f.config.AuthCodeURL(state)}},
+			StatusCode: http.StatusFound,
+			Status:     "Moved Temporarily",
+		})
+		return
+	}
+
+	log.Infof("do exchange")
+	// authcode flow
+	oauth2Token, err := f.config.Exchange(r.Context(), r.URL.Query().Get("code"))
+	if err != nil {
+		// TODO(sszuecs) review error handling
+		unauthorized(ctx, "Failed to exchange token: "+err.Error()+", state: "+state, invalidClaim, r.Host)
+		return
+	}
+
+	if !oauth2Token.Valid() {
+		unauthorized(ctx, "invalid token", invalidToken, r.Host)
+		return
+	}
+
+	var allowed bool
+	var data []byte
+	var sub string
+	switch f.typ {
+	case checkOidcUserInfos:
+		userInfo, err := f.provider.UserInfo(r.Context(), oauth2.StaticTokenSource(oauth2Token))
+		if err != nil {
+			unauthorized(ctx, "Failed to get userinfo: "+err.Error(), invalidToken, r.Host)
+			return
+		}
+		sub = userInfo.Subject
+
+		resp := struct {
+			OAuth2Token *oauth2.Token
+			UserInfo    *oidc.UserInfo
+		}{oauth2Token, userInfo}
+		data, err = json.Marshal(resp)
+		if err != nil {
+			unauthorized(ctx, fmt.Sprintf("Failed to marshal userinfo backend data for sub=%s: %v", sub, err), invalidToken, r.Host)
+			return
+		}
+
+		allowed = true // nothing to do
+
+	case checkOidcAnyClaims:
+		rawIDToken, ok := oauth2Token.Extra("id_token").(string)
+		if !ok {
+			unauthorized(ctx, "No id_token field in oauth2 token", invalidToken, r.Host)
+			return
+		}
+		idToken, err := f.verifier.Verify(r.Context(), rawIDToken)
+		if err != nil {
+			unauthorized(ctx, "Failed to verify ID Token: "+err.Error(), invalidToken, r.Host)
+			return
+		}
+
+		tokenMap := make(map[string]interface{})
+		if err := idToken.Claims(&tokenMap); err != nil {
+			unauthorized(ctx, "Failed to get claims: "+err.Error(), invalidToken, r.Host)
+			return
+		}
+
+		sub, ok = tokenMap["sub"].(string)
+		if !ok {
+			unauthorized(ctx, "Failed to get sub", invalidToken, r.Host)
+			return
+		}
+
+		resp := struct {
+			OAuth2Token *oauth2.Token
+			TokenMap    map[string]interface{}
+		}{oauth2Token, tokenMap}
+		data, err = json.Marshal(resp)
+		if err != nil {
+			unauthorized(ctx, fmt.Sprintf("Failed to prepare data for backend with sub=%s: %v", sub, err), invalidToken, r.Host)
+			return
+		}
+
+		allowed = f.validateAnyClaims(tokenMap)
+
+	case checkOidcAllClaims:
+		rawIDToken, ok := oauth2Token.Extra("id_token").(string)
+		if !ok {
+			unauthorized(ctx, "No id_token field in oauth2 token", invalidToken, r.Host)
+			return
+		}
+		idToken, err := f.verifier.Verify(r.Context(), rawIDToken)
+		if err != nil {
+			unauthorized(ctx, "Failed to verify ID Token: "+err.Error(), invalidToken, r.Host)
+			return
+		}
+
+		tokenMap := make(map[string]interface{})
+		if err := idToken.Claims(&tokenMap); err != nil {
+			unauthorized(ctx, "Failed to get claims: "+err.Error(), invalidToken, r.Host)
+			return
+		}
+
+		sub, ok = tokenMap["sub"].(string)
+		if !ok {
+			unauthorized(ctx, "Failed to get sub", invalidToken, r.Host)
+			return
+		}
+
+		resp := struct {
+			OAuth2Token *oauth2.Token
+			TokenMap    map[string]interface{}
+		}{oauth2Token, tokenMap}
+		data, err = json.Marshal(resp)
+		if err != nil {
+			unauthorized(ctx, fmt.Sprintf("Failed to prepare data for backend with sub=%s: %v", sub, err), invalidToken, r.Host)
+			return
+		}
+
+		allowed = f.validateAllClaims(nil)
+		log.Infof("validateAllClaims: %v", allowed)
+	default:
+		log.Errorf("Wrong tokeninfoFilter type: %s", f)
+	}
+
+	if !allowed {
+		log.Infof("unauthorized")
+		// TODO(sszuecs) review error handling
+		unauthorized(ctx, sub, invalidClaim, r.Host)
+		return
+	}
+	log.Infof("send authorized")
+	authorized(ctx, string(data))
+}
