@@ -2,9 +2,13 @@ package auth
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -16,6 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando/skipper/filters"
 	logfilter "github.com/zalando/skipper/filters/log"
+	"golang.org/x/crypto/scrypt"
 	"golang.org/x/oauth2"
 )
 
@@ -71,6 +76,8 @@ const (
 	tokeninfoCacheKey            = "tokeninfo"
 	tokenintrospectionCacheKey   = "tokenintrospection"
 	tokenIntrospectionConfigPath = "/.well-known/openid-configuration"
+	oidcStatebagKey              = "oauthOidcKey"
+	oauthOidcCookieName          = "skipperOauthOidc"
 )
 
 type (
@@ -834,11 +841,15 @@ type (
 	}
 
 	tokenOidcFilter struct {
-		typ      roleCheckType
-		config   *oauth2.Config
-		provider *oidc.Provider
-		verifier *oidc.IDTokenVerifier
-		claims   []string
+		typ        roleCheckType
+		config     *oauth2.Config
+		provider   *oidc.Provider
+		verifier   *oidc.IDTokenVerifier
+		claims     []string
+		validity   time.Duration
+		aead       cipher.AEAD
+		nonce      []byte
+		cookiename string
 	}
 )
 
@@ -868,8 +879,22 @@ func (s *tokenOidcSpec) CreateFilter(args []interface{}) (filters.Filter, error)
 	ctx := context.Background()
 	provider, err := oidc.NewProvider(ctx, providerURL.String())
 	if err != nil {
+		log.Errorf("Failed to create new provider %s: %v", providerURL, err)
 		return nil, filters.ErrInvalidFilterParameters
 	}
+
+	aesgcm, nonce, err := getCiphersuite()
+	if err != nil {
+		log.Errorf("Failed to create ciphersuite: %v", err)
+		return nil, filters.ErrInvalidFilterParameters
+	}
+
+	h := sha256.New()
+	for _, s := range sargs {
+		h.Write([]byte(s))
+	}
+	byteSlice := h.Sum(nil)
+	sargsHash := fmt.Sprintf("%x", byteSlice)[:8]
 
 	f := &tokenOidcFilter{
 		typ: s.typ,
@@ -883,6 +908,10 @@ func (s *tokenOidcSpec) CreateFilter(args []interface{}) (filters.Filter, error)
 		verifier: provider.Verifier(&oidc.Config{
 			ClientID: sargs[1],
 		}),
+		validity:   1 * time.Hour,
+		aead:       aesgcm,
+		nonce:      nonce,
+		cookiename: oauthOidcCookieName + sargsHash,
 	}
 	f.config.Scopes = []string{oidc.ScopeOpenID}
 
@@ -943,6 +972,7 @@ func (f *tokenOidcFilter) validateAllClaims(h map[string]interface{}) bool {
 }
 
 const (
+	secretSize    = 20
 	letterBytes   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	letterIdxBits = 6                    // 6 bits to represent a letter index
 	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
@@ -973,28 +1003,119 @@ func randString(n int) string {
 	return string(b)
 }
 
-func (f *tokenOidcFilter) Response(ctx filters.FilterContext) {}
+func getCiphersuite() (cipher.AEAD, []byte, error) {
+	password := getPassword()
+	salt := getSalt()
+	nonce := getNonce()
+
+	key, err := scrypt.Key(password, salt, 1<<15, 8, 1, 32)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create key: %v", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create new cipher: %v", err)
+	}
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create new GCM: %v", err)
+	}
+	return aesgcm, nonce, nil
+}
+
+// getPassword returns a secret byte slice to use as secret encryption key
+// TODO(sszuecs): add enc/dec cipher support and get all keymaterial from trusted sources
+func getPassword() []byte {
+	return []byte("supersecret")
+}
+
+// getSalt returns an 8 byte salt
+// TODO(sszuecs): get salt from trusted sources
+func getSalt() []byte {
+	return []byte{0xc8, 0x28, 0xf2, 0x58, 0xa7, 0x6a, 0xad, 0x7b}
+}
+
+// getNonce returns a 12 byte nonce
+// TODO(sszuecs): get nonce from trusted sources
+// 2^32 > 4b requests, might be ok without rotation
+func getNonce() []byte {
+	return []byte{0xde, 0xad, 0xbe, 0xef, 0xc8, 0x28, 0xf2, 0x58, 0xa7, 0x6a, 0xad, 0x7b}
+}
+
+func getTimestampFromState(b []byte, nonceLength int) time.Time {
+	ts := string(b[secretSize : len(b)-nonceLength])
+	i, err := strconv.Atoi(ts)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(int64(i), 0)
+
+}
+func createState(nonce string) string {
+	return randString(secretSize) + fmt.Sprintf("%d", time.Now().Add(1*time.Minute).Unix()) + nonce
+}
+
+func (f *tokenOidcFilter) doRedirect(ctx filters.FilterContext) {
+	statePlain := createState(fmt.Sprintf("%x", f.nonce))
+	stateEnc := f.aead.Seal(nil, f.nonce, []byte(statePlain), nil)
+	log.Infof("serve redirect: state:%s", statePlain)
+	ctx.Serve(&http.Response{
+		Header: http.Header{
+			"Location": []string{f.config.AuthCodeURL(fmt.Sprintf("%x", stateEnc))},
+		},
+		StatusCode: http.StatusFound,
+		Status:     "Moved Temporarily",
+	})
+}
+
+// Response saves our state bag in a cookie, such that we can get it
+// back in supsequent requests to handle the requests.
+func (f *tokenOidcFilter) Response(ctx filters.FilterContext) {
+	if v, ok := ctx.StateBag()[oidcStatebagKey]; ok {
+		state, ok := v.(string)
+		if !ok {
+			return
+		}
+		cookie := &http.Cookie{
+			Name:     f.cookiename,
+			Value:    state,
+			Secure:   true,
+			HttpOnly: false,
+			Path:     "/",
+			Domain:   ctx.Request().Host,
+			MaxAge:   int(f.validity.Seconds()),
+			Expires:  time.Now().Add(f.validity),
+		}
+		http.SetCookie(ctx.ResponseWriter(), cookie)
+	}
+}
+
 func (f *tokenOidcFilter) Request(ctx filters.FilterContext) {
 	var state string
 	log.Infof("tokenOidcFilter got a request")
 	r := ctx.Request()
-	stateQuery := r.URL.Query().Get("state")
-	_, ok := stateMap[stateQuery]
-	if ok {
-		state = stateQuery
-	} else {
-		state = randString(30)
-		stateMap[state] = true
-		log.Infof("serve redirect: f:%v, f.config:%v", f, f.config)
-		ctx.Serve(&http.Response{
-			Header:     http.Header{"Location": []string{f.config.AuthCodeURL(state)}},
-			StatusCode: http.StatusFound,
-			Status:     "Moved Temporarily",
-		})
+
+	// CSRF protection using similar to
+	// https://www.owasp.org/index.php/Cross-Site_Request_Forgery_(CSRF)_Prevention_Cheat_Sheet#Encrypted_Token_Pattern,
+	// because of
+	// https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
+	stateQueryEncHex := r.URL.Query().Get("state")
+	stateQueryEnc := make([]byte, len(stateQueryEncHex))
+	if _, err := fmt.Sscanf(stateQueryEncHex, "%x", &stateQueryEnc); err != nil && err != io.EOF {
+		log.Fatalf("Failed to sscanf: %v", err)
+	}
+	stateQueryPlain, err := f.aead.Open(nil, f.nonce, stateQueryEnc, nil)
+	if err != nil {
+		f.doRedirect(ctx)
+		return
+	}
+	if time.Now().After(getTimestampFromState(stateQueryPlain, len(fmt.Sprintf("%x", f.nonce)))) {
+		// state query is older than allowed -> enforce login
+		f.doRedirect(ctx)
 		return
 	}
 
-	log.Infof("do exchange")
+	log.Infof("do exchange\n========= failure after this are fine =======")
 	// authcode flow
 	oauth2Token, err := f.config.Exchange(r.Context(), r.URL.Query().Get("code"))
 	if err != nil {
@@ -1008,9 +1129,13 @@ func (f *tokenOidcFilter) Request(ctx filters.FilterContext) {
 		return
 	}
 
-	var allowed bool
-	var data []byte
-	var sub string
+	// encrypt(bas64(full token data)) and put it into a set-cookie and put into state bag
+
+	var (
+		allowed bool
+		data    []byte
+		sub     string
+	)
 	switch f.typ {
 	case checkOidcUserInfos:
 		userInfo, err := f.provider.UserInfo(r.Context(), oauth2.StaticTokenSource(oauth2Token))
@@ -1102,7 +1227,7 @@ func (f *tokenOidcFilter) Request(ctx filters.FilterContext) {
 			return
 		}
 
-		allowed = f.validateAllClaims(nil)
+		allowed = f.validateAllClaims(tokenMap)
 		log.Infof("validateAllClaims: %v", allowed)
 	default:
 		log.Errorf("Wrong tokeninfoFilter type: %s", f)
@@ -1114,6 +1239,16 @@ func (f *tokenOidcFilter) Request(ctx filters.FilterContext) {
 		unauthorized(ctx, sub, invalidClaim, r.Host)
 		return
 	}
+
+	encryptedData := encryptData(f.aead, f.nonce, data)
+	ctx.StateBag()[oidcStatebagKey] = encryptedData
+
 	log.Infof("send authorized")
-	authorized(ctx, string(data))
+	authorized(ctx, sub)
+}
+
+func encryptData(aead cipher.AEAD, nonce, plaintext []byte) []byte {
+	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+	log.Infof("plaintext: %s\nciphertext: %x\n", plaintext, ciphertext)
+	return ciphertext
 }
